@@ -9,3 +9,6 @@
 /Gateway/obj
 /Sensor/obj
 /Servidor/obj
+/Gateway/.vs/Gateway
+/Sensor/.vs/Sensor
+/Servidor/.vs/Servidor
