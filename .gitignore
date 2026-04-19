@@ -12,3 +12,6 @@
 /Gateway/.vs/Gateway
 /Sensor/.vs/Sensor
 /Servidor/.vs/Servidor
+/Gateway/bin/Debug
+/Sensor/bin/Debug
+/Servidor/bin/Debug
