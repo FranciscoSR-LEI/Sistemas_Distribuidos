@@ -1,618 +1,738 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
-using System.Net;
 using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
 using System.Threading;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
 
-class GatewayApp
+namespace GatewayApp;
+
+public class MonitoringMessage
 {
-    static readonly object configLock = new object();
-    static readonly object logLock = new object();
-    static readonly object heartbeatDictLock = new object();
+    public string MessageType { get; set; } = "";
+    public string Timestamp { get; set; } = "";
+    public string SensorId { get; set; } = "";
+    public string Zona { get; set; } = "";
+    public string Tipo { get; set; } = "";
+    public string Valor { get; set; } = "";
+    public string FileName { get; set; } = "";
+    public string FileContentBase64 { get; set; } = "";
+}
 
-    static readonly string configFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sensores_config.csv");
-    static readonly string logFile = "gateway_log.txt";
+public class SensorConfig
+{
+    public string SensorId { get; set; } = "";
+    public string Estado { get; set; } = "";
+    public string Zona { get; set; } = "";
+    public List<string> Tipos { get; set; } = new();
+    public string LastSync { get; set; } = "";
+}
 
-    static readonly Dictionary<string, DateTime> lastHeartbeats =
-        new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+public class PreprocessRequest
+{
+    public string Tipo { get; set; } = "";
+    public string Valor { get; set; } = "";
+}
 
-    static readonly HashSet<string> inactiveAlerted =
-        new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+public class PreprocessResponse
+{
+    public bool Ok { get; set; }
+    public string NormalizedValue { get; set; } = "";
+    public string Notes { get; set; } = "";
+}
 
-    static void Main(string[] args)
+public class GatewayOptions
+{
+    public string InstanceName { get; }
+    public string Zona { get; }
+    public string QueueName { get; }
+    public string ExchangeName { get; }
+    public string ConfigFile { get; }
+    public string LogFile { get; }
+
+    public GatewayOptions(string instanceName, string zona, string configFile)
     {
-        int port = 5000;
-        TcpListener listener = new TcpListener(IPAddress.Any, port);
-        listener.Start();
+        InstanceName = instanceName;
+        Zona = zona;
+        ExchangeName = "urban.topic";
+        QueueName = $"queue.{zona.ToLowerInvariant()}";
+        ConfigFile = configFile;
+        LogFile = $"gateway_{instanceName.ToLowerInvariant()}_{zona.ToLowerInvariant()}.log";
+    }
+}
 
-        Console.WriteLine($"[GATEWAY] À escuta na porta {port}...");
+public interface ILoggerService
+{
+    void Write(string message);
+}
 
-        Thread heartbeatMonitor = new Thread(MonitorHeartbeats)
-        {
-            IsBackground = true
-        };
-        heartbeatMonitor.Start();
+public class FileLoggerService : ILoggerService
+{
+    private readonly string _logFile;
+    private readonly object _lockObj = new();
 
-        while (true)
-        {
-            TcpClient client = listener.AcceptTcpClient();
-            client.NoDelay = true;
-            client.ReceiveTimeout = 30000;
-            client.SendTimeout = 30000;
-
-            Console.WriteLine("[GATEWAY] Sensor ligado.");
-
-            Thread clientThread = new Thread(() => HandleSensor(client))
-            {
-                IsBackground = true
-            };
-            clientThread.Start();
-        }
+    public FileLoggerService(string logFile)
+    {
+        _logFile = logFile;
     }
 
-    static void HandleSensor(TcpClient client)
+    public void Write(string message)
     {
-        string sessionSensorId = null;
-        string sessionZona = null;
-        bool helloDone = false;
-
-        try
+        lock (_lockObj)
         {
-            NetworkStream ns = client.GetStream();
-            StreamReader reader = new StreamReader(ns);
-            StreamWriter writer = new StreamWriter(ns) { AutoFlush = true };
-
-            string line;
-            while ((line = reader.ReadLine()) != null)
-            {
-                Console.WriteLine("[GATEWAY] Recebido: " + line);
-
-                string[] parts = line.Split('|');
-                if (parts.Length == 0)
-                {
-                    writer.WriteLine("ERROR|mensagem_invalida");
-                    continue;
-                }
-
-                string command = parts[0];
-
-                if (!helloDone)
-                {
-                    if (command != "HELLO")
-                    {
-                        writer.WriteLine("ERROR|hello_obrigatorio");
-                        continue;
-                    }
-
-                    if (parts.Length != 4)
-                    {
-                        writer.WriteLine("HELLO_ACK|ERROR|mensagem_invalida");
-                        continue;
-                    }
-
-                    string sensorId = parts[1].Trim();
-                    string zona = parts[2].Trim();
-                    string tipos = parts[3].Trim();
-
-                    if (!SensorExiste(sensorId))
-                    {
-                        writer.WriteLine("HELLO_ACK|ERROR|sensor_nao_registado");
-                        continue;
-                    }
-
-                    string estado = GetEstadoSensor(sensorId);
-                    if (IsManutencao(estado))
-                    {
-                        writer.WriteLine("HELLO_ACK|ERROR|sensor_manutencao");
-                        continue;
-                    }
-
-                    if (estado.Equals("desativado", StringComparison.OrdinalIgnoreCase))
-                    {
-                        writer.WriteLine("HELLO_ACK|ERROR|sensor_desativado");
-                        continue;
-                    }
-
-                    string zonaConfig = GetZonaSensor(sensorId);
-                    if (!zonaConfig.Equals(zona, StringComparison.OrdinalIgnoreCase))
-                    {
-                        writer.WriteLine("HELLO_ACK|ERROR|zona_invalida");
-                        continue;
-                    }
-
-                    sessionSensorId = sensorId;
-                    sessionZona = zona;
-                    helloDone = true;
-
-                    UpdateLastSync(sensorId);
-                    UpdateHeartbeat(sensorId);
-                    Log($"HELLO aceite de {sensorId} na zona {zona} com tipos {tipos}");
-
-                    writer.WriteLine("HELLO_ACK|OK");
-                    continue;
-                }
-
-                if (command == "DATA")
-                {
-                    if (parts.Length != 6)
-                    {
-                        writer.WriteLine("DATA_ACK|ERROR|mensagem_invalida");
-                        continue;
-                    }
-
-                    string timestamp = parts[1].Trim();
-                    string sensorId = parts[2].Trim();
-                    string zona = parts[3].Trim();
-                    string tipo = parts[4].Trim();
-                    string valor = parts[5].Trim();
-
-                    if (!ValidateSession(writer, sessionSensorId, sessionZona, sensorId, zona, "DATA_ACK"))
-                        continue;
-
-                    if (!SensorExiste(sensorId))
-                    {
-                        writer.WriteLine("DATA_ACK|ERROR|sensor_nao_registado");
-                        continue;
-                    }
-
-                    if (!SensorAtivo(sensorId))
-                    {
-                        writer.WriteLine("DATA_ACK|ERROR|sensor_indisponivel");
-                        continue;
-                    }
-
-                    if (!TipoSuportado(sensorId, tipo))
-                    {
-                        writer.WriteLine("DATA_ACK|ERROR|tipo_nao_suportado");
-                        continue;
-                    }
-
-                    UpdateLastSync(sensorId);
-                    UpdateHeartbeat(sensorId);
-                    Log($"DATA de {sensorId}: {tipo}={valor}");
-
-                    bool ok = EncaminharParaServidorTexto($"STORE|{timestamp}|{sensorId}|{zona}|{tipo}|{valor}");
-                    writer.WriteLine(ok ? "DATA_ACK|OK" : "DATA_ACK|ERROR|falha_no_servidor");
-                }
-                else if (command == "HEARTBEAT")
-                {
-                    if (parts.Length != 3)
-                    {
-                        writer.WriteLine("HEARTBEAT_ACK|ERROR|mensagem_invalida");
-                        continue;
-                    }
-
-                    string timestamp = parts[1].Trim();
-                    string sensorId = parts[2].Trim();
-
-                    if (sessionSensorId == null || !sessionSensorId.Equals(sensorId, StringComparison.OrdinalIgnoreCase))
-                    {
-                        writer.WriteLine("HEARTBEAT_ACK|ERROR|sessao_invalida");
-                        continue;
-                    }
-
-                    if (!SensorExiste(sensorId))
-                    {
-                        writer.WriteLine("HEARTBEAT_ACK|ERROR|sensor_nao_registado");
-                        continue;
-                    }
-
-                    UpdateLastSync(sensorId);
-                    UpdateHeartbeat(sensorId);
-                    Log($"HEARTBEAT de {sensorId} em {timestamp}");
-
-                    writer.WriteLine("HEARTBEAT_ACK|OK");
-                }
-                else if (command == "VIDEO_REQUEST")
-                {
-                    if (parts.Length != 6)
-                    {
-                        writer.WriteLine("VIDEO_ACK|ERROR|mensagem_invalida");
-                        continue;
-                    }
-
-                    string timestamp = parts[1].Trim();
-                    string sensorId = parts[2].Trim();
-                    string zona = parts[3].Trim();
-                    string fileName = parts[4].Trim();
-
-                    if (!long.TryParse(parts[5].Trim(), out long fileSize) || fileSize < 0)
-                    {
-                        writer.WriteLine("VIDEO_ACK|ERROR|tamanho_invalido");
-                        continue;
-                    }
-
-                    if (!ValidateSession(writer, sessionSensorId, sessionZona, sensorId, zona, "VIDEO_ACK"))
-                        continue;
-
-                    if (!SensorExiste(sensorId))
-                    {
-                        writer.WriteLine("VIDEO_ACK|ERROR|sensor_nao_registado");
-                        continue;
-                    }
-
-                    if (!SensorAtivo(sensorId))
-                    {
-                        writer.WriteLine("VIDEO_ACK|ERROR|sensor_indisponivel");
-                        continue;
-                    }
-
-                    if (!TipoSuportado(sensorId, "VIDEO"))
-                    {
-                        writer.WriteLine("VIDEO_ACK|ERROR|tipo_nao_suportado");
-                        continue;
-                    }
-
-                    UpdateLastSync(sensorId);
-                    UpdateHeartbeat(sensorId);
-                    Log($"VIDEO_REQUEST de {sensorId}: {fileName} ({fileSize} bytes)");
-
-                    writer.WriteLine("VIDEO_ACK|READY");
-                    writer.Flush();
-
-                    byte[] videoBytes = ReceiveBytes(ns, fileSize);
-                    if (videoBytes == null || videoBytes.Length != fileSize)
-                    {
-                        writer.WriteLine("VIDEO_ACK|ERROR|falha_rececao_video");
-                        continue;
-                    }
-
-                    bool ok = EncaminharVideoParaServidor(timestamp, sensorId, zona, fileName, videoBytes);
-
-                    writer.WriteLine(ok
-                        ? "VIDEO_ACK|OK|video_encaminhado"
-                        : "VIDEO_ACK|ERROR|falha_no_servidor");
-                }
-                else if (command == "BYE")
-                {
-                    if (parts.Length != 2)
-                    {
-                        writer.WriteLine("BYE_ACK|ERROR|mensagem_invalida");
-                        continue;
-                    }
-
-                    string sensorId = parts[1].Trim();
-
-                    if (sessionSensorId == null || !sessionSensorId.Equals(sensorId, StringComparison.OrdinalIgnoreCase))
-                    {
-                        writer.WriteLine("BYE_ACK|ERROR|sessao_invalida");
-                        continue;
-                    }
-
-                    Log($"BYE de {sensorId}");
-                    writer.WriteLine("BYE_ACK|OK");
-                    break;
-                }
-                else
-                {
-                    writer.WriteLine("ERROR|mensagem_invalida");
-                }
-            }
-        }
-        catch (IOException ex)
-        {
-            Log("Ligação terminada/timeout com sensor: " + ex.Message);
-            Console.WriteLine("[GATEWAY] Ligação terminada/timeout: " + ex.Message);
-        }
-        catch (Exception ex)
-        {
-            Log("Erro no gateway: " + ex.Message);
-            Console.WriteLine("[GATEWAY] Erro: " + ex.Message);
-        }
-        finally
-        {
-            try { client.Close(); } catch { }
-            Console.WriteLine("[GATEWAY] Ligação terminada.");
+            string line = $"{DateTime.Now:s} {message}";
+            File.AppendAllText(_logFile, line + Environment.NewLine);
         }
     }
+}
 
-    static byte[] ReceiveBytes(NetworkStream ns, long totalBytes)
+public class GatewayConfigRepository
+{
+    private readonly string _configFile;
+    private readonly object _lockObj = new();
+
+    public GatewayConfigRepository(string configFile)
     {
-        try
+        _configFile = configFile;
+    }
+
+    public SensorConfig? GetById(string sensorId)
+    {
+        lock (_lockObj)
         {
-            byte[] buffer = new byte[8192];
-            long totalRead = 0;
+            if (!File.Exists(_configFile))
+                return null;
 
-            MemoryStream ms = new MemoryStream();
-
-            while (totalRead < totalBytes)
+            foreach (string line in File.ReadAllLines(_configFile))
             {
-                int toRead = (int)Math.Min(buffer.Length, totalBytes - totalRead);
-                int bytesRead = ns.Read(buffer, 0, toRead);
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
 
-                if (bytesRead <= 0)
-                    return null;
+                string[] parts = line.Split(':');
+                if (parts.Length < 5)
+                    continue;
 
-                ms.Write(buffer, 0, bytesRead);
-                totalRead += bytesRead;
+                if (!parts[0].Trim().Equals(sensorId, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                string tiposPart = parts[3].Trim().Replace("[", "").Replace("]", "");
+                List<string> tipos = new();
+
+                foreach (string tipo in tiposPart.Split(','))
+                {
+                    if (!string.IsNullOrWhiteSpace(tipo))
+                        tipos.Add(tipo.Trim());
+                }
+
+                return new SensorConfig
+                {
+                    SensorId = parts[0].Trim(),
+                    Estado = parts[1].Trim(),
+                    Zona = parts[2].Trim(),
+                    Tipos = tipos,
+                    LastSync = parts[4].Trim()
+                };
             }
 
-            return ms.ToArray();
-        }
-        catch
-        {
             return null;
         }
     }
 
-    static bool EncaminharVideoParaServidor(string timestamp, string sensorId, string zona, string fileName, byte[] videoBytes)
+    public void UpdateLastSync(string sensorId)
+    {
+        lock (_lockObj)
+        {
+            if (!File.Exists(_configFile))
+                return;
+
+            string[] lines = File.ReadAllLines(_configFile);
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (string.IsNullOrWhiteSpace(lines[i]))
+                    continue;
+
+                string[] parts = lines[i].Split(':');
+                if (parts.Length < 5)
+                    continue;
+
+                if (!parts[0].Trim().Equals(sensorId, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                parts[4] = DateTime.Now.ToString("s");
+                lines[i] = string.Join(":", parts);
+                break;
+            }
+
+            File.WriteAllLines(_configFile, lines);
+        }
+    }
+
+    public IEnumerable<string> GetBindingsForZone(string zona)
+    {
+        HashSet<string> bindings = new(StringComparer.OrdinalIgnoreCase);
+
+        lock (_lockObj)
+        {
+            if (!File.Exists(_configFile))
+                return bindings;
+
+            foreach (string line in File.ReadAllLines(_configFile))
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+
+                string[] parts = line.Split(':');
+                if (parts.Length < 5)
+                    continue;
+
+                string estado = parts[1].Trim();
+                string zonaConfig = parts[2].Trim();
+
+                if (!estado.Equals("ativo", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!zonaConfig.Equals(zona, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                string tiposPart = parts[3].Trim().Replace("[", "").Replace("]", "");
+                string[] tipos = tiposPart.Split(',');
+
+                bindings.Add($"{zona}.HELLO");
+                bindings.Add($"{zona}.HEARTBEAT");
+                bindings.Add($"{zona}.BYE");
+                bindings.Add($"{zona}.VIDEO");
+
+                foreach (string tipo in tipos)
+                {
+                    if (!string.IsNullOrWhiteSpace(tipo))
+                        bindings.Add($"{zona}.{tipo.Trim()}");
+                }
+            }
+        }
+
+        return bindings;
+    }
+}
+
+public class HeartbeatRegistry
+{
+    private readonly Dictionary<string, DateTime> _lastHeartbeats = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _inactiveAlerted = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _lockObj = new();
+
+    public void Update(string sensorId)
+    {
+        lock (_lockObj)
+        {
+            _lastHeartbeats[sensorId] = DateTime.Now;
+            _inactiveAlerted.Remove(sensorId);
+        }
+    }
+
+    public List<string> GetInactiveSensors()
+    {
+        List<string> result = new();
+
+        lock (_lockObj)
+        {
+            foreach (var kvp in _lastHeartbeats)
+            {
+                if ((DateTime.Now - kvp.Value).TotalSeconds > 30 && !_inactiveAlerted.Contains(kvp.Key))
+                {
+                    result.Add(kvp.Key);
+                    _inactiveAlerted.Add(kvp.Key);
+                }
+            }
+        }
+
+        return result;
+    }
+}
+
+public class PreprocessRpcClient
+{
+    private readonly string _host;
+    private readonly int _port;
+    private readonly ILoggerService _logger;
+
+    public PreprocessRpcClient(string host, int port, ILoggerService logger)
+    {
+        _host = host;
+        _port = port;
+        _logger = logger;
+    }
+
+    public PreprocessResponse Normalize(string tipo, string valor)
     {
         try
         {
-            TcpClient serverClient = new TcpClient("127.0.0.1", 6000);
+            using TcpClient rpcClient = new(_host, _port);
+            using NetworkStream ns = rpcClient.GetStream();
+            using StreamWriter writer = new(ns) { AutoFlush = true };
+            using StreamReader reader = new(ns);
+
+            PreprocessRequest request = new()
+            {
+                Tipo = tipo,
+                Valor = valor
+            };
+
+            writer.WriteLine(JsonSerializer.Serialize(request));
+
+            string? responseJson = reader.ReadLine();
+            if (responseJson == null)
+                return new PreprocessResponse { Ok = false };
+
+            PreprocessResponse? response = JsonSerializer.Deserialize<PreprocessResponse>(responseJson);
+            return response ?? new PreprocessResponse { Ok = false };
+        }
+        catch (Exception ex)
+        {
+            _logger.Write("Erro RPC pré-processamento: " + ex.Message);
+            return new PreprocessResponse { Ok = false };
+        }
+    }
+}
+
+public class ServerForwarder
+{
+    private readonly string _host;
+    private readonly int _port;
+    private readonly ILoggerService _logger;
+
+    public ServerForwarder(string host, int port, ILoggerService logger)
+    {
+        _host = host;
+        _port = port;
+        _logger = logger;
+    }
+
+    public bool SendStore(
+        string timestamp,
+        string sensorId,
+        string zona,
+        string tipo,
+        string valor,
+        string processedByGateway)
+    {
+        try
+        {
+            using TcpClient serverClient = new(_host, _port);
+            serverClient.NoDelay = true;
+            serverClient.ReceiveTimeout = 15000;
+            serverClient.SendTimeout = 15000;
+
+            using NetworkStream ns = serverClient.GetStream();
+            using StreamWriter writer = new(ns) { AutoFlush = true };
+            using StreamReader reader = new(ns);
+
+            string message = $"STORE|{timestamp}|{sensorId}|{zona}|{tipo}|{valor}|{processedByGateway}";
+            writer.WriteLine(message);
+
+            string? response = reader.ReadLine();
+            _logger.Write($"Encaminhado ao servidor: {message} | Resposta: {response}");
+
+            return response != null && response.Contains("OK", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex)
+        {
+            _logger.Write("Erro ao ligar ao servidor: " + ex.Message);
+            return false;
+        }
+    }
+
+    public bool SendVideo(
+        string timestamp,
+        string sensorId,
+        string zona,
+        string fileName,
+        byte[] videoBytes,
+        string processedByGateway)
+    {
+        try
+        {
+            using TcpClient serverClient = new(_host, _port);
             serverClient.NoDelay = true;
             serverClient.ReceiveTimeout = 30000;
             serverClient.SendTimeout = 30000;
 
-            NetworkStream ns = serverClient.GetStream();
-            StreamReader reader = new StreamReader(ns);
-            StreamWriter writer = new StreamWriter(ns) { AutoFlush = true };
+            using NetworkStream ns = serverClient.GetStream();
+            using StreamReader reader = new(ns);
+            using StreamWriter writer = new(ns) { AutoFlush = true };
 
-            string header = $"VIDEO_UPLOAD|{timestamp}|{sensorId}|{zona}|{fileName}|{videoBytes.Length}";
+            string header = $"VIDEO_UPLOAD|{timestamp}|{sensorId}|{zona}|{fileName}|{videoBytes.Length}|{processedByGateway}";
             writer.WriteLine(header);
             writer.Flush();
 
-            string ready = reader.ReadLine();
+            string? ready = reader.ReadLine();
             if (ready == null || !ready.Equals("VIDEO_UPLOAD_ACK|READY", StringComparison.OrdinalIgnoreCase))
             {
-                Log($"Servidor não ficou pronto para vídeo de {sensorId}. Resposta: {ready}");
+                _logger.Write($"Servidor não ficou pronto para vídeo de {sensorId}. Resposta: {ready}");
                 return false;
             }
 
             ns.Write(videoBytes, 0, videoBytes.Length);
             ns.Flush();
 
-            string finalAck = reader.ReadLine();
-            Log($"Vídeo encaminhado ao servidor: {header} | Resposta: {finalAck}");
+            string? finalAck = reader.ReadLine();
+            _logger.Write($"Vídeo encaminhado ao servidor: {header} | Resposta: {finalAck}");
 
             return finalAck != null && finalAck.Equals("VIDEO_UPLOAD_ACK|OK", StringComparison.OrdinalIgnoreCase);
         }
         catch (Exception ex)
         {
-            Log("Erro ao encaminhar vídeo ao servidor: " + ex.Message);
+            _logger.Write("Erro ao encaminhar vídeo ao servidor: " + ex.Message);
             return false;
         }
     }
+}
 
-    static bool EncaminharParaServidorTexto(string mensagem)
+public class GatewayMessageProcessor
+{
+    private readonly GatewayOptions _options;
+    private readonly GatewayConfigRepository _configRepository;
+    private readonly HeartbeatRegistry _heartbeatRegistry;
+    private readonly PreprocessRpcClient _preprocessRpcClient;
+    private readonly ServerForwarder _serverForwarder;
+    private readonly ILoggerService _logger;
+
+    public GatewayMessageProcessor(
+        GatewayOptions options,
+        GatewayConfigRepository configRepository,
+        HeartbeatRegistry heartbeatRegistry,
+        PreprocessRpcClient preprocessRpcClient,
+        ServerForwarder serverForwarder,
+        ILoggerService logger)
     {
-        try
+        _options = options;
+        _configRepository = configRepository;
+        _heartbeatRegistry = heartbeatRegistry;
+        _preprocessRpcClient = preprocessRpcClient;
+        _serverForwarder = serverForwarder;
+        _logger = logger;
+    }
+
+    public void Process(MonitoringMessage msg)
+    {
+        Console.WriteLine($"[{_options.InstanceName}] Recebido: type={msg.MessageType}, sensor={msg.SensorId}, zona={msg.Zona}, tipo={msg.Tipo}");
+
+        switch (msg.MessageType)
         {
-            TcpClient serverClient = new TcpClient("127.0.0.1", 6000);
-            serverClient.NoDelay = true;
-            serverClient.ReceiveTimeout = 15000;
-            serverClient.SendTimeout = 15000;
-
-            NetworkStream ns = serverClient.GetStream();
-            StreamWriter writer = new StreamWriter(ns) { AutoFlush = true };
-            StreamReader reader = new StreamReader(ns);
-
-            writer.WriteLine(mensagem);
-            string response = reader.ReadLine();
-
-            Log($"Encaminhado ao servidor: {mensagem} | Resposta: {response}");
-
-            return response != null && response.IndexOf("OK", StringComparison.OrdinalIgnoreCase) >= 0;
-        }
-        catch (Exception ex)
-        {
-            Log("Erro ao ligar ao servidor: " + ex.Message);
-            return false;
+            case "HELLO":
+                ProcessHello(msg);
+                break;
+            case "HEARTBEAT":
+                ProcessHeartbeat(msg);
+                break;
+            case "DATA":
+                ProcessData(msg);
+                break;
+            case "VIDEO":
+                ProcessVideo(msg);
+                break;
+            case "BYE":
+                _logger.Write($"BYE de {msg.SensorId}");
+                Console.WriteLine($"[{_options.InstanceName}] Sensor {msg.SensorId} terminou.");
+                break;
         }
     }
 
-    static bool ValidateSession(
-        StreamWriter writer,
-        string sessionSensorId,
-        string sessionZona,
-        string sensorId,
-        string zona,
-        string ackPrefix)
+    private void ProcessHello(MonitoringMessage msg)
     {
-        if (sessionSensorId == null || sessionZona == null)
+        SensorConfig? config = _configRepository.GetById(msg.SensorId);
+        if (config == null)
         {
-            writer.WriteLine($"{ackPrefix}|ERROR|sessao_invalida");
-            return false;
+            _logger.Write($"HELLO rejeitado: sensor {msg.SensorId} não registado");
+            return;
         }
 
-        if (!sessionSensorId.Equals(sensorId, StringComparison.OrdinalIgnoreCase))
+        if (!IsActive(config))
         {
-            writer.WriteLine($"{ackPrefix}|ERROR|sensor_id_invalido");
-            return false;
+            _logger.Write($"HELLO rejeitado: sensor {msg.SensorId} indisponível");
+            return;
         }
 
-        if (!sessionZona.Equals(zona, StringComparison.OrdinalIgnoreCase))
+        if (!config.Zona.Equals(msg.Zona, StringComparison.OrdinalIgnoreCase))
         {
-            writer.WriteLine($"{ackPrefix}|ERROR|zona_invalida");
-            return false;
+            _logger.Write($"HELLO rejeitado: zona inválida de {msg.SensorId}");
+            return;
         }
 
-        return true;
+        _configRepository.UpdateLastSync(msg.SensorId);
+        _heartbeatRegistry.Update(msg.SensorId);
+
+        _logger.Write($"HELLO aceite de {msg.SensorId} na zona {msg.Zona}");
     }
 
-    static bool SensorExiste(string sensorId)
+    private void ProcessHeartbeat(MonitoringMessage msg)
     {
-        lock (configLock)
-        {
-            if (!File.Exists(configFile))
-                return false;
+        SensorConfig? config = _configRepository.GetById(msg.SensorId);
+        if (config == null)
+            return;
 
-            foreach (string line in File.ReadAllLines(configFile))
+        _configRepository.UpdateLastSync(msg.SensorId);
+        _heartbeatRegistry.Update(msg.SensorId);
+        _logger.Write($"HEARTBEAT de {msg.SensorId}");
+    }
+
+    private void ProcessData(MonitoringMessage msg)
+    {
+        SensorConfig? config = _configRepository.GetById(msg.SensorId);
+        if (config == null)
+        {
+            _logger.Write($"DATA rejeitado: sensor {msg.SensorId} não registado");
+            return;
+        }
+
+        if (!IsActive(config))
+        {
+            _logger.Write($"DATA rejeitado: sensor {msg.SensorId} indisponível");
+            return;
+        }
+
+        if (!SupportsType(config, msg.Tipo))
+        {
+            _logger.Write($"DATA rejeitado: tipo {msg.Tipo} não suportado por {msg.SensorId}");
+            return;
+        }
+
+        PreprocessResponse response = _preprocessRpcClient.Normalize(msg.Tipo, msg.Valor);
+        if (!response.Ok)
+        {
+            _logger.Write($"Pré-processamento falhou para {msg.SensorId}");
+            return;
+        }
+
+        _configRepository.UpdateLastSync(msg.SensorId);
+        _heartbeatRegistry.Update(msg.SensorId);
+
+        bool ok = _serverForwarder.SendStore(
+            msg.Timestamp,
+            msg.SensorId,
+            msg.Zona,
+            msg.Tipo,
+            response.NormalizedValue,
+            _options.InstanceName);
+
+        _logger.Write(ok
+            ? $"DATA encaminhado para servidor: gateway={_options.InstanceName}, sensor={msg.SensorId}, {msg.Tipo}={response.NormalizedValue}"
+            : $"Falha ao encaminhar DATA de {msg.SensorId}");
+    }
+
+    private void ProcessVideo(MonitoringMessage msg)
+    {
+        SensorConfig? config = _configRepository.GetById(msg.SensorId);
+        if (config == null)
+        {
+            _logger.Write($"VIDEO rejeitado: sensor {msg.SensorId} não registado");
+            return;
+        }
+
+        if (!IsActive(config))
+        {
+            _logger.Write($"VIDEO rejeitado: sensor {msg.SensorId} indisponível");
+            return;
+        }
+
+        if (!SupportsType(config, "VIDEO"))
+        {
+            _logger.Write($"VIDEO rejeitado: sensor {msg.SensorId} não suporta VIDEO");
+            return;
+        }
+
+        byte[] videoBytes = Convert.FromBase64String(msg.FileContentBase64);
+
+        _configRepository.UpdateLastSync(msg.SensorId);
+        _heartbeatRegistry.Update(msg.SensorId);
+
+        bool ok = _serverForwarder.SendVideo(
+            msg.Timestamp,
+            msg.SensorId,
+            msg.Zona,
+            msg.FileName,
+            videoBytes,
+            _options.InstanceName);
+
+        _logger.Write(ok
+            ? $"VIDEO encaminhado para servidor: gateway={_options.InstanceName}, sensor={msg.SensorId}, ficheiro={msg.FileName}"
+            : $"Falha ao encaminhar VIDEO de {msg.SensorId}");
+    }
+
+    private static bool IsActive(SensorConfig config)
+    {
+        if (config.Estado.Equals("desativado", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (config.Estado.Equals("manutencao", StringComparison.OrdinalIgnoreCase) ||
+            config.Estado.Equals("manutenção", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return config.Estado.Equals("ativo", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool SupportsType(SensorConfig config, string tipo)
+    {
+        foreach (string t in config.Tipos)
+        {
+            if (t.Equals(tipo, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+}
+
+public class GatewayHost
+{
+    private readonly GatewayOptions _options;
+    private readonly GatewayConfigRepository _configRepository;
+    private readonly GatewayMessageProcessor _processor;
+    private readonly HeartbeatRegistry _heartbeatRegistry;
+    private readonly ILoggerService _logger;
+
+    public GatewayHost(
+        GatewayOptions options,
+        GatewayConfigRepository configRepository,
+        GatewayMessageProcessor processor,
+        HeartbeatRegistry heartbeatRegistry,
+        ILoggerService logger)
+    {
+        _options = options;
+        _configRepository = configRepository;
+        _processor = processor;
+        _heartbeatRegistry = heartbeatRegistry;
+        _logger = logger;
+    }
+
+    public void Run()
+    {
+        Console.WriteLine($"[{_options.InstanceName}] Gateway iniciado para a zona {_options.Zona}");
+        Console.WriteLine($"[{_options.InstanceName}] Queue partilhada da zona: {_options.QueueName}");
+
+        Thread monitorThread = new(MonitorHeartbeats)
+        {
+            IsBackground = true
+        };
+        monitorThread.Start();
+
+        ConnectionFactory factory = new()
+        {
+            HostName = "localhost",
+            UserName = "guest",
+            Password = "guest"
+        };
+
+        using IConnection connection = factory.CreateConnection();
+        using IModel channel = connection.CreateModel();
+
+        channel.ExchangeDeclare(
+            exchange: _options.ExchangeName,
+            type: ExchangeType.Topic,
+            durable: false,
+            autoDelete: false);
+
+        channel.QueueDeclare(
+            queue: _options.QueueName,
+            durable: false,
+            exclusive: false,
+            autoDelete: false);
+
+        channel.BasicQos(0, 1, false);
+
+        foreach (string binding in _configRepository.GetBindingsForZone(_options.Zona))
+        {
+            channel.QueueBind(
+                queue: _options.QueueName,
+                exchange: _options.ExchangeName,
+                routingKey: binding);
+
+            Console.WriteLine($"[{_options.InstanceName}] Binding: {binding}");
+        }
+
+        EventingBasicConsumer consumer = new(channel);
+        consumer.Received += (model, ea) =>
+        {
+            try
             {
-                if (string.IsNullOrWhiteSpace(line)) continue;
+                string json = Encoding.UTF8.GetString(ea.Body.ToArray());
+                MonitoringMessage? msg = JsonSerializer.Deserialize<MonitoringMessage>(json);
 
-                string[] parts = line.Split(':');
-                if (parts.Length >= 5 && parts[0].Trim().Equals(sensorId, StringComparison.OrdinalIgnoreCase))
-                    return true;
-            }
-
-            return false;
-        }
-    }
-
-    static string GetEstadoSensor(string sensorId)
-    {
-        lock (configLock)
-        {
-            if (!File.Exists(configFile))
-                return "";
-
-            foreach (string line in File.ReadAllLines(configFile))
-            {
-                if (string.IsNullOrWhiteSpace(line)) continue;
-
-                string[] parts = line.Split(':');
-                if (parts.Length >= 5 && parts[0].Trim().Equals(sensorId, StringComparison.OrdinalIgnoreCase))
-                    return parts[1].Trim();
-            }
-
-            return "";
-        }
-    }
-
-    static string GetZonaSensor(string sensorId)
-    {
-        lock (configLock)
-        {
-            if (!File.Exists(configFile))
-                return "";
-
-            foreach (string line in File.ReadAllLines(configFile))
-            {
-                if (string.IsNullOrWhiteSpace(line)) continue;
-
-                string[] parts = line.Split(':');
-                if (parts.Length >= 5 && parts[0].Trim().Equals(sensorId, StringComparison.OrdinalIgnoreCase))
-                    return parts[2].Trim();
-            }
-
-            return "";
-        }
-    }
-
-    static bool IsManutencao(string estado)
-    {
-        return estado.Equals("manutencao", StringComparison.OrdinalIgnoreCase) ||
-               estado.Equals("manutenção", StringComparison.OrdinalIgnoreCase);
-    }
-
-    static bool SensorAtivo(string sensorId)
-    {
-        string estado = GetEstadoSensor(sensorId);
-
-        if (estado.Equals("desativado", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        if (IsManutencao(estado))
-            return false;
-
-        return estado.Equals("ativo", StringComparison.OrdinalIgnoreCase);
-    }
-
-    static bool TipoSuportado(string sensorId, string tipo)
-    {
-        lock (configLock)
-        {
-            if (!File.Exists(configFile))
-                return false;
-
-            foreach (string line in File.ReadAllLines(configFile))
-            {
-                if (string.IsNullOrWhiteSpace(line)) continue;
-
-                string[] parts = line.Split(':');
-
-                if (parts.Length >= 5 && parts[0].Trim().Equals(sensorId, StringComparison.OrdinalIgnoreCase))
+                if (msg != null)
                 {
-                    string tiposPart = parts[3].Trim().Replace("[", "").Replace("]", "");
-                    string[] tipos = tiposPart.Split(',');
-
-                    foreach (string t in tipos)
-                    {
-                        if (t.Trim().Equals(tipo, StringComparison.OrdinalIgnoreCase))
-                            return true;
-                    }
-
-                    return false;
+                    _processor.Process(msg);
                 }
+
+                channel.BasicAck(ea.DeliveryTag, false);
             }
-
-            return false;
-        }
-    }
-
-    static void UpdateLastSync(string sensorId)
-    {
-        lock (configLock)
-        {
-            if (!File.Exists(configFile))
-                return;
-
-            string[] lines = File.ReadAllLines(configFile);
-
-            for (int i = 0; i < lines.Length; i++)
+            catch (Exception ex)
             {
-                if (string.IsNullOrWhiteSpace(lines[i])) continue;
-
-                string[] parts = lines[i].Split(':');
-                if (parts.Length >= 5 && parts[0].Trim().Equals(sensorId, StringComparison.OrdinalIgnoreCase))
-                {
-                    parts[4] = DateTime.Now.ToString("s");
-                    lines[i] = string.Join(":", parts);
-                    break;
-                }
+                Console.WriteLine($"[{_options.InstanceName}] Erro no consumo RabbitMQ: " + ex.Message);
+                channel.BasicAck(ea.DeliveryTag, false);
             }
+        };
 
-            File.WriteAllLines(configFile, lines);
-        }
+        channel.BasicConsume(
+            queue: _options.QueueName,
+            autoAck: false,
+            consumer: consumer);
+
+        Console.WriteLine($"[{_options.InstanceName}] À escuta. Prima ENTER para terminar.");
+        Console.ReadLine();
     }
 
-    static void Log(string message)
-    {
-        lock (logLock)
-        {
-            string line = $"{DateTime.Now:s} {message}";
-            File.AppendAllText(logFile, line + Environment.NewLine);
-        }
-    }
-
-    static void UpdateHeartbeat(string sensorId)
-    {
-        lock (heartbeatDictLock)
-        {
-            lastHeartbeats[sensorId] = DateTime.Now;
-            inactiveAlerted.Remove(sensorId);
-        }
-    }
-
-    static void MonitorHeartbeats()
+    private void MonitorHeartbeats()
     {
         while (true)
         {
             Thread.Sleep(10000);
 
-            List<string> sensoresInativos = new List<string>();
-
-            lock (heartbeatDictLock)
+            foreach (string sensorId in _heartbeatRegistry.GetInactiveSensors())
             {
-                foreach (var kvp in lastHeartbeats)
-                {
-                    TimeSpan diff = DateTime.Now - kvp.Value;
-                    if (diff.TotalSeconds > 30 && !inactiveAlerted.Contains(kvp.Key))
-                    {
-                        sensoresInativos.Add(kvp.Key);
-                        inactiveAlerted.Add(kvp.Key);
-                    }
-                }
-            }
-
-            foreach (string sensorId in sensoresInativos)
-            {
-                Log($"ALERTA: Sensor {sensorId} sem heartbeat há mais de 30 segundos");
-                Console.WriteLine($"[GATEWAY] ALERTA: Sensor {sensorId} inativo");
+                _logger.Write($"ALERTA: Sensor {sensorId} sem heartbeat há mais de 30 segundos");
+                Console.WriteLine($"[{_options.InstanceName}] ALERTA: Sensor {sensorId} inativo");
             }
         }
+    }
+}
+
+public static class Program
+{
+    public static void Main(string[] args)
+    {
+        Console.Write("Nome da instância do gateway (ex: G1, G2): ");
+        string instanceName = Console.ReadLine()?.Trim() ?? "G1";
+
+        Console.Write("Zona do gateway (ZONA_ESCOLAR, ZONA_CENTRO, ZONA_INDUSTRIAL, ZONA_RESIDENCIAL): ");
+        string zona = (Console.ReadLine()?.Trim() ?? "ZONA_ESCOLAR").ToUpperInvariant();
+
+        string configFile = @"C:\Users\vitor\source\repos\Trabalho_SD_fianl2\Gateway\sensores_config.csv";
+
+        GatewayOptions options = new(instanceName, zona, configFile);
+        GatewayConfigRepository configRepository = new(options.ConfigFile);
+        HeartbeatRegistry heartbeatRegistry = new();
+        FileLoggerService logger = new(options.LogFile);
+        PreprocessRpcClient preprocessRpcClient = new("127.0.0.1", 7000, logger);
+        ServerForwarder serverForwarder = new("127.0.0.1", 6000, logger);
+
+        GatewayMessageProcessor processor = new(
+            options,
+            configRepository,
+            heartbeatRegistry,
+            preprocessRpcClient,
+            serverForwarder,
+            logger);
+
+        GatewayHost host = new(
+            options,
+            configRepository,
+            processor,
+            heartbeatRegistry,
+            logger);
+
+        host.Run();
     }
 }

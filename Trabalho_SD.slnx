@@ -1,0 +1,9 @@
+<Solution>
+  <Project Path="AnaliseRPC/AnaliseRPC.csproj" Id="5ddf695f-ec06-4e1e-ac52-bdebe71dd6ef" />
+  <Project Path="ConsultaCLI/ConsultaCLI.csproj" Id="a4c16014-1db2-4837-b771-6c2e7ff804cf" />
+  <Project Path="Gateway/Gateway.csproj" />
+  <Project Path="PreprocessamentoRPC/PreprocessamentoRPC.csproj" Id="80b6f8a6-0ec5-4e72-b5ff-dc3ce39964b8" />
+  <Project Path="Sensor/Sensor.csproj" />
+  <Project Path="Servidor/Servidor.csproj" />
+  <Project Path="Trabalho_SD/Trabalho_SD.csproj" />
+</Solution>
