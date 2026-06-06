@@ -1,0 +1,14 @@
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\bin\Debug\net10.0\AnaliseRPC.exe
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\bin\Debug\net10.0\AnaliseRPC.deps.json
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\bin\Debug\net10.0\AnaliseRPC.runtimeconfig.json
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\bin\Debug\net10.0\AnaliseRPC.dll
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\bin\Debug\net10.0\AnaliseRPC.pdb
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\obj\Debug\net10.0\AnaliseRPC.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\obj\Debug\net10.0\AnaliseRPC.AssemblyInfoInputs.cache
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\obj\Debug\net10.0\AnaliseRPC.AssemblyInfo.cs
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\obj\Debug\net10.0\AnaliseRPC.csproj.CoreCompileInputs.cache
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\obj\Debug\net10.0\AnaliseRPC.dll
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\obj\Debug\net10.0\refint\AnaliseRPC.dll
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\obj\Debug\net10.0\AnaliseRPC.pdb
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\obj\Debug\net10.0\AnaliseRPC.genruntimeconfig.cache
+C:\Users\vitor\source\repos\Trabalho_SD_fianl2\AnaliseRPC\obj\Debug\net10.0\ref\AnaliseRPC.dll
